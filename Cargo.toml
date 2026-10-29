@@ -8,3 +8,5 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1.54", features = ["full"] }
 core_affinity = "0.8.0"
 nix = {version = "0.31", features = ["sched"]}
+tokio-util = "0.7.2"
+socket2 = "0.6.5"
