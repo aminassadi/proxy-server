@@ -11,3 +11,4 @@ nix = {version = "0.31", features = ["sched", "signal", "process"]}
 tokio-util = "0.7.2"
 socket2 = "0.6.5"
 signal-hook = "0.3"
+httparse = "1"
