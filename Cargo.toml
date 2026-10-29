@@ -7,6 +7,7 @@ edition = "2024"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1.54", features = ["full"] }
 core_affinity = "0.8.0"
-nix = {version = "0.31", features = ["sched"]}
+nix = {version = "0.31", features = ["sched", "signal", "process"]}
 tokio-util = "0.7.2"
 socket2 = "0.6.5"
+signal-hook = "0.3"

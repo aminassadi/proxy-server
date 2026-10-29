@@ -1,12 +1,14 @@
 use socket2::{Domain, Protocol, Socket, Type};
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, println, sync::Arc};
 use tokio::{
     io,
     net::TcpListener,
     runtime::{Builder, Runtime},
 };
 use tokio_util::sync::CancellationToken;
-struct AsyncProxy {
+
+use tokio::signal::unix::{signal, SignalKind};
+pub struct AsyncProxy {
     inbound: SocketAddr,
     outbound: SocketAddr,
     rt: Runtime,
@@ -39,8 +41,9 @@ impl AsyncProxy {
     ) -> std::io::Result<()> {
         let listener = bind_reuseport(inbound).await?;
         let outbound = Arc::new(outbound);
-
+        tokio::spawn(install_shutdown_signals(shutdown.clone()));
         loop {
+            
             tokio::select! {
                 biased;
 
@@ -54,14 +57,15 @@ impl AsyncProxy {
                     let shutdown = shutdown.clone();
 
                     tokio::spawn(async move {
-                        tokio::select! {
-                            _ = shutdown.cancelled() => {}
-                            // r = handle_connection(stream, peer, &outbound) => {
-                            //     if let Err(e) = r {
-                            //         eprintln!("[{peer}] {e}");
-                            //     }
-                            // }
-                        }
+                        println!("incomming socket: {peer}, pid: {}", std::process::id());
+                        // tokio::select! {
+                        //     _ = shutdown.cancelled() => {}
+                        //     // r = handle_connection(stream, peer, &outbound) => {
+                        //     //     if let Err(e) = r {
+                        //     //         eprintln!("[{peer}] {e}");
+                        //     //     }
+                        //     // }
+                        // }
                     });
                 }
             }
@@ -80,4 +84,16 @@ pub async fn bind_reuseport(addr: SocketAddr) -> io::Result<TcpListener> {
     let std_listener: std::net::TcpListener = socket.into();
     std_listener.set_nonblocking(true)?;
     TcpListener::from_std(std_listener)
+}
+
+async fn install_shutdown_signals(shutdown: CancellationToken) {
+    let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+    
+    tokio::select! {
+        _ = sigint.recv() => {}
+        _ = sigterm.recv() => {}
+    }
+    println!("shutdown received");
+    shutdown.cancel();
 }
