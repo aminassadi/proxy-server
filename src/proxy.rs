@@ -20,8 +20,6 @@ pub struct AsyncProxy {
     shutdown: CancellationToken,
 }
 
-
-
 impl AsyncProxy {
     pub fn new(inbound: SocketAddr, outbound: SocketAddr) -> std::io::Result<Self> {
         let rt = Builder::new_current_thread().enable_all().build()?;
@@ -85,7 +83,7 @@ async fn handle_connection(
     outbound: &std::net::SocketAddr,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
-    let mut client_buff = Vec::with_capacity(8192);
+    let mut client_buff = vec![0u8; 8192];
     let mut server_buff = vec![0u8; 8192];
 
     let mut server_stream = TcpStream::connect(outbound).await?;
@@ -93,7 +91,7 @@ async fn handle_connection(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            r = client_stream.read_buf(&mut client_buff) => {
+            r = client_stream.read(&mut client_buff) => {
                 let n = r?;
                 if n == 0 {
                     return Ok(());
@@ -130,7 +128,7 @@ async fn handle_connection(
                     }
                 }
             }
-            r = server_stream.read_buf(&mut server_buff) =>{
+            r = server_stream.read(&mut server_buff) =>{
                 let n = r?;
                 client_stream.write_all(&server_buff[..n]).await?
             }
@@ -166,5 +164,3 @@ async fn install_shutdown_signals(shutdown: CancellationToken) {
 pub async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
     TcpStream::connect(addr).await
 }
-
-
