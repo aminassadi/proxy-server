@@ -22,7 +22,7 @@ pub struct AsyncProxy {
 
 impl AsyncProxy {
     pub fn new(inbound: SocketAddr, outbound: SocketAddr) -> std::io::Result<Self> {
-        let rt = Builder::new_current_thread().enable_all().build()?;
+        let rt: Runtime = Builder::new_current_thread().enable_all().build()?;
 
         Ok(Self {
             inbound,
@@ -50,7 +50,6 @@ impl AsyncProxy {
                 biased;
 
                 _ = shutdown.cancelled() => {
-                    // stop accepting; in-flight tasks get dropped when we return
                     break;
                 }
                 accepted = listener.accept() => {
@@ -83,53 +82,97 @@ async fn handle_connection(
     outbound: &std::net::SocketAddr,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
-    let mut client_buff = vec![0u8; 8192];
+    let mut client_buff = Vec::with_capacity(64 * 1024);
     let mut server_buff = vec![0u8; 8192];
+    let mut content_len: Option<usize> = None;
+    let mut body_received: usize = 0;
 
     let mut server_stream = TcpStream::connect(outbound).await?;
 
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            r = client_stream.read(&mut client_buff) => {
-                let n = r?;
-                if n == 0 {
+            r = client_stream.read_buf(&mut client_buff) => {
+                let incomming_packet_len = r?;
+                if incomming_packet_len == 0 {
                     return Ok(());
                 }
-
-                let mut headers = [httparse::EMPTY_HEADER; 64];
-                let mut req = httparse::Request::new(&mut headers);
-                match req.parse(&client_buff) {
-                    Ok(httparse::Status::Complete(n)) => {
-                        println!(
-                            "[{peer}] {} {} HTTP/1.{}",
-                            req.method.unwrap_or("?"),
-                            req.path.unwrap_or("?"),
-                            req.version.unwrap_or(0),
-                        );
-
-                        for h in req.headers.iter() {
-                            println!("  {}: {}", h.name, String::from_utf8_lossy(h.value));
+                while !client_buff.is_empty(){
+                    if content_len.is_none(){
+                        let mut headers = [httparse::EMPTY_HEADER; 64];
+                        let mut req = httparse::Request::new(&mut headers);
+                        match req.parse(&client_buff) {
+                            Ok(httparse::Status::Complete(n)) => {
+                                println!(
+                                    "[{peer}] {} {} HTTP/1.{}",
+                                    req.method.unwrap_or("?"),
+                                    req.path.unwrap_or("?"),
+                                    req.version.unwrap_or(0),
+                                );
+                                let mut cl = 0usize;
+                                for h in req.headers.iter() {
+                                    println!("  {}: {}", h.name, String::from_utf8_lossy(h.value));
+                                    if h.name.eq_ignore_ascii_case("transfer-encoding") {
+                                            let v = String::from_utf8_lossy(h.value).to_ascii_lowercase();
+                                            if v.split(',').any(|t| t.trim() == "chunked") {
+                                                return Err(std::io::Error::new(
+                                                    std::io::ErrorKind::InvalidData,
+                                                    "chunked not yet supported",
+                                                ));
+                                            }
+                                        }
+                                    if h.name.eq_ignore_ascii_case("content-length") {
+                                        cl = std::str::from_utf8(h.value)
+                                        .ok()
+                                        .and_then(|s| s.trim().parse().ok())
+                                        .ok_or_else(|| std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData, "bad Content-Length"))?;
+                                    }
+                                }
+                                server_stream.write_all(&client_buff[..n]).await?;
+                                client_buff.drain(..n);
+                                content_len = Some(cl);
+                            }
+                            Ok(httparse::Status::Partial) => {
+                                if client_buff.len() > 64 * 1024 {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "request headers exceed 64 KiB",
+                                    ));
+                                }
+                                break;
+                            }
+                            Err(e) => {
+                                eprintln!("[{peer}] malformed: {e}");
+                                return Ok(());
+                            }
                         }
-                        server_stream.write_all(&client_buff[..n]).await?
                     }
-                    Ok(httparse::Status::Partial) => {
-                        if client_buff.len() > 64 * 1024 {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "request headers exceed 64 KiB",
-                            ));
+                      if let Some(cl) = content_len {
+                        let remaining = cl - body_received;
+                        let take = remaining.min(client_buff.len());
+                        if take > 0 {
+                            server_stream.write_all(&client_buff[..take]).await?;
+                            client_buff.drain(..take);             // BytesMut: use .advance(take)
+                            body_received += take;
                         }
-                        continue;
+                        if body_received >= cl {
+                            content_len = None;
+                            body_received = 0;
+                        }else{
+                            break;
+                        }
+                 }
                     }
-                    Err(e) => {
-                        eprintln!("[{peer}] malformed: {e}");
-                        return Ok(());
-                    }
-                }
+
+
+
             }
             r = server_stream.read(&mut server_buff) =>{
                 let n = r?;
+                if n==0{
+                    return Ok(()) //todo: this is error server connection failed, may response with 500
+                }
                 client_stream.write_all(&server_buff[..n]).await?
             }
         }
@@ -161,6 +204,4 @@ async fn install_shutdown_signals(shutdown: CancellationToken) {
     shutdown.cancel();
 }
 
-pub async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
-    TcpStream::connect(addr).await
-}
+pub fn validate_request() {}
