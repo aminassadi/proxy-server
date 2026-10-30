@@ -115,10 +115,8 @@ async fn handle_connection(
                                     if h.name.eq_ignore_ascii_case("transfer-encoding") {
                                             let v = String::from_utf8_lossy(h.value).to_ascii_lowercase();
                                             if v.split(',').any(|t| t.trim() == "chunked") {
-                                                return Err(std::io::Error::new(
-                                                    std::io::ErrorKind::InvalidData,
-                                                    "chunked not yet supported",
-                                                ));
+                                                client_stream.write_all(&length_required()).await?;
+                                                return Ok(());
                                             }
                                         }
                                     if h.name.eq_ignore_ascii_case("content-length") {
@@ -144,6 +142,7 @@ async fn handle_connection(
                             }
                             Err(e) => {
                                 eprintln!("[{peer}] malformed: {e}");
+                                client_stream.write_all(&bad_request("malformed")).await?;
                                 return Ok(());
                             }
                         }
@@ -153,7 +152,7 @@ async fn handle_connection(
                         let take = remaining.min(client_buff.len());
                         if take > 0 {
                             server_stream.write_all(&client_buff[..take]).await?;
-                            client_buff.drain(..take);             // BytesMut: use .advance(take)
+                            client_buff.drain(..take);            
                             body_received += take;
                         }
                         if body_received >= cl {
@@ -163,10 +162,7 @@ async fn handle_connection(
                             break;
                         }
                  }
-                    }
-
-
-
+             }
             }
             r = server_stream.read(&mut server_buff) =>{
                 let n = r?;
@@ -205,3 +201,31 @@ async fn install_shutdown_signals(shutdown: CancellationToken) {
 }
 
 pub fn validate_request() {}
+
+fn bad_request(reason: &str) -> Vec<u8> {
+    error_response(400, "Bad Request", reason)
+}
+
+fn length_required() -> Vec<u8> {
+    error_response(411, "Length Required", "request body length could not be determined")
+}
+
+fn error_response(status: u16, reason: &str, detail: &str) -> Vec<u8> {
+    let body = format!("{status} {reason}\n{detail}\n");
+    let body = body.replace('\r', "").replace('\n', " ").trim_end().to_string()
+             + "\n";
+    let mut out = Vec::with_capacity(128 + body.len());
+    out.extend_from_slice(
+        format!(
+            "HTTP/1.1 {status} {reason}\r\n\
+             Content-Type: text/plain; charset=utf-8\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            body.len()
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(body.as_bytes());
+    out
+}
