@@ -1,6 +1,6 @@
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{net::SocketAddr, println, sync::Arc};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::{
     io,
     net::TcpListener,
@@ -8,7 +8,11 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::signal::unix::{SignalKind, signal};
+
+const MAX_BACKLOG: i32 = 1024;
+
 pub struct AsyncProxy {
     inbound: SocketAddr,
     outbound: SocketAddr,
@@ -16,7 +20,7 @@ pub struct AsyncProxy {
     shutdown: CancellationToken,
 }
 
-const MAX_BACKLOG: i32 = 1024;
+
 
 impl AsyncProxy {
     pub fn new(inbound: SocketAddr, outbound: SocketAddr) -> std::io::Result<Self> {
@@ -58,9 +62,10 @@ impl AsyncProxy {
 
                     tokio::spawn(async move {
                         println!("incomming socket: {peer}, pid: {}", std::process::id());
+
                         tokio::select! {
                             _ = shutdown.cancelled() => {}
-                            r = handle_connection(stream, peer, &outbound) => {
+                            r = handle_connection(stream, peer, &outbound, shutdown.clone()) => {
                                 if let Err(e) = r {
                                     eprintln!("[{peer}] {e}");
                                 }
@@ -72,6 +77,66 @@ impl AsyncProxy {
         }
         Ok(())
     }
+}
+
+async fn handle_connection(
+    mut client_stream: tokio::net::TcpStream,
+    peer: std::net::SocketAddr,
+    outbound: &std::net::SocketAddr,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    let mut client_buff = Vec::with_capacity(8192);
+    let mut server_buff = vec![0u8; 8192];
+
+    let mut server_stream = TcpStream::connect(outbound).await?;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            r = client_stream.read_buf(&mut client_buff) => {
+                let n = r?;
+                if n == 0 {
+                    return Ok(());
+                }
+
+                let mut headers = [httparse::EMPTY_HEADER; 64];
+                let mut req = httparse::Request::new(&mut headers);
+                match req.parse(&client_buff) {
+                    Ok(httparse::Status::Complete(n)) => {
+                        println!(
+                            "[{peer}] {} {} HTTP/1.{}",
+                            req.method.unwrap_or("?"),
+                            req.path.unwrap_or("?"),
+                            req.version.unwrap_or(0),
+                        );
+
+                        for h in req.headers.iter() {
+                            println!("  {}: {}", h.name, String::from_utf8_lossy(h.value));
+                        }
+                        server_stream.write_all(&client_buff[..n]).await?
+                    }
+                    Ok(httparse::Status::Partial) => {
+                        if client_buff.len() > 64 * 1024 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "request headers exceed 64 KiB",
+                            ));
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!("[{peer}] malformed: {e}");
+                        return Ok(());
+                    }
+                }
+            }
+            r = server_stream.read_buf(&mut server_buff) =>{
+                let n = r?;
+                client_stream.write_all(&server_buff[..n]).await?
+            }
+        }
+    }
+    return Ok(());
 }
 
 pub async fn bind_reuseport(addr: SocketAddr) -> io::Result<TcpListener> {
@@ -98,61 +163,8 @@ async fn install_shutdown_signals(shutdown: CancellationToken) {
     shutdown.cancel();
 }
 
-async fn handle_connection(
-    mut stream: tokio::net::TcpStream,
-    peer: std::net::SocketAddr,
-    _outbound: &std::net::SocketAddr,
-) -> std::io::Result<()> {
-    let mut buf = Vec::with_capacity(8192);
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-
-    loop {
-        let n = stream.read_buf(&mut buf).await?;
-        if n == 0 {
-            return Ok(());
-        }
-
-        let header_len = {
-            let mut headers = [httparse::EMPTY_HEADER; 64];
-            let mut req = httparse::Request::new(&mut headers);
-
-            match req.parse(&buf) {
-                Ok(httparse::Status::Complete(n)) => {
-                    println!(
-                        "[{peer}] {} {} HTTP/1.{}",
-                        req.method.unwrap_or("?"),
-                        req.path.unwrap_or("?"),
-                        req.version.unwrap_or(0),
-                    );
-
-                    for h in req.headers.iter() {
-                        println!("  {}: {}", h.name, String::from_utf8_lossy(h.value));
-                    }
-
-                    n
-                }
-                Ok(httparse::Status::Partial) => {
-                    if buf.len() > 64 * 1024 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "request headers exceed 64 KiB",
-                        ));
-                    }
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("[{peer}] malformed: {e}");
-                    return Ok(());
-                }
-            }
-        }; // req and headers drop here; buf can be mutated again
-
-        println!(
-            "  headers_end={header_len}, body_bytes_so_far={}",
-            buf.len() - header_len,
-        );
-
-        // Process the request before reading more, or consume the processed bytes.
-        return Ok(());
-    }
+pub async fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
+    TcpStream::connect(addr).await
 }
+
+
