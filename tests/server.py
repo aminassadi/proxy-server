@@ -2,7 +2,10 @@
 """Minimal origin HTTP server for testing the proxy.
 
 Supports: keep-alive, pipelining, chunked requests, arbitrary body sizes.
-Response body: 'method=... path=... version=... body_len=N body_md5=XXXXXXXX'
+Response body embeds a fingerprint of what was received:
+    'method=... path=... version=... body_len=N body_md5=XXXXXXXX'
+
+Use it as the proxy's outbound target. Run with --verbose to log headers.
 """
 import argparse
 import hashlib
@@ -14,7 +17,7 @@ import time
 
 log = logging.getLogger("origin")
 
-# ── instrumentation ────────────────────────────────────────────────
+# ── instrumentation (safe to read on shutdown) ─────────────────────
 _conn_counter = itertools.count(1)
 _accepts = 0
 _closes = 0
@@ -22,7 +25,7 @@ _requests = 0
 _stats_lock = threading.Lock()
 
 
-def bump(name):
+def _bump(name):
     global _accepts, _closes, _requests
     with _stats_lock:
         if name == "accept":
@@ -33,7 +36,12 @@ def bump(name):
             _requests += 1
 
 
-# ── helpers ────────────────────────────────────────────────────────
+def _snapshot():
+    with _stats_lock:
+        return _accepts, _closes, _requests
+
+
+# ── socket helpers ─────────────────────────────────────────────────
 def read_until(sock, buf, marker):
     while marker not in buf:
         chunk = sock.recv(65536)
@@ -53,88 +61,80 @@ def read_exact(sock, buf, n):
     return buf[:n], buf[n:]
 
 
+# ── request handler ────────────────────────────────────────────────
 class Handler(socketserver.BaseRequestHandler):
     def handle(self):
         cid = next(_conn_counter)
         peer = f"{self.client_address[0]}:{self.client_address[1]}"
-        bump("accept")
+        _bump("accept")
         log.info(f"[c{cid}] accept from {peer}")
         t0 = time.monotonic()
         try:
-            self._serve(cid, peer)
+            self._serve(cid)
+        except Exception as e:
+            log.exception(f"[c{cid}] unhandled: {e}")
         finally:
             dur = time.monotonic() - t0
-            bump("close")
+            _bump("close")
             log.info(f"[c{cid}] close (lifetime {dur*1000:.0f} ms)")
 
-    def _serve(self, cid, peer):
+    def _serve(self, cid):
         sock = self.request
         buf = b""
         req_n = 0
+
         while True:
             head, buf = read_until(sock, buf, b"\r\n\r\n")
             if head is None:
                 log.info(f"[c{cid}] peer EOF")
                 return
+
             lines = head.split(b"\r\n")
             try:
                 method, path, version = lines[0].decode().split(" ", 2)
             except ValueError:
                 log.warning(f"[c{cid}] malformed request line: {lines[0]!r}")
                 return
+
             req_n += 1
-            bump("request")
+            _bump("request")
 
             headers = {}
             for line in lines[1:]:
                 k, _, v = line.partition(b":")
-                headers[k.strip().lower().decode()] = v.strip().decode()
+                headers[k.strip().lower().decode(errors="replace")] = \
+                    v.strip().decode(errors="replace")
 
             chunked = "chunked" in headers.get("transfer-encoding", "").lower()
-            cl = int(headers.get("content-length", "0"))
 
             if chunked:
-                body = b""
-                chunk_count = 0
-                while True:
-                    size_line, buf = read_until(sock, buf, b"\r\n")
-                    if size_line is None:
-                        log.warning(f"[c{cid}] peer EOF mid-chunk")
-                        return
-                    size = int(size_line, 16)
-                    if size == 0:
-                        while True:
-                            trailer, buf = read_until(sock, buf, b"\r\n")
-                            if trailer is None:
-                                return
-                            if trailer == b"":
-                                break
-                        break
-                    data, buf = read_exact(sock, buf, size + 2)
-                    if data is None:
-                        log.warning(f"[c{cid}] peer EOF mid-chunk-data")
-                        return
-                    body += data[:size]
-                    chunk_count += 1
-                cl = len(body)
+                body, chunk_count, ok = self._read_chunked(sock, buf, cid)
+                if not ok:
+                    return
+                buf = ok  # _read_chunked returns leftover in 3rd slot
             else:
-                data, buf = read_exact(sock, buf, cl)
-                if data is None:
+                try:
+                    cl = int(headers.get("content-length", "0"))
+                except ValueError:
+                    cl = 0
+                body, buf = read_exact(sock, buf, cl)
+                if body is None:
                     log.warning(f"[c{cid}] peer EOF mid-body (wanted {cl})")
                     return
-                body = data
                 chunk_count = 0
 
+            cl_final = len(body)
             digest = hashlib.md5(body).hexdigest()[:8]
             resp_body = (
                 f"method={method} path={path} version={version} "
-                f"body_len={len(body)} body_md5={digest}\n"
+                f"body_len={cl_final} body_md5={digest}\n"
             ).encode()
 
             keep_alive = True
+            conn_hdr = headers.get("connection", "").lower()
             if version == "HTTP/1.0":
-                keep_alive = headers.get("connection", "").lower() == "keep-alive"
-            elif headers.get("connection", "").lower() == "close":
+                keep_alive = conn_hdr == "keep-alive"
+            elif conn_hdr == "close":
                 keep_alive = False
 
             resp = (
@@ -146,14 +146,13 @@ class Handler(socketserver.BaseRequestHandler):
             ).encode() + resp_body
             sock.sendall(resp)
 
-            # ── one-line request log ──────────────────────────────
             te = "chunked" if chunked else "-"
-            conn = headers.get("connection", "-") or "-"
+            conn = conn_hdr or "-"
             extra = f" chunks={chunk_count}" if chunked else ""
             log.info(
                 f"[c{cid}] #{req_n} {method} {path} {version} "
-                f"host={headers.get('host','-')} cl={cl} te={te} conn={conn} "
-                f"-> 200 body_len={len(body)} md5={digest}{extra}"
+                f"host={headers.get('host','-')} cl={cl_final} te={te} "
+                f"conn={conn} -> 200 body_len={cl_final} md5={digest}{extra}"
             )
             log.debug(
                 f"[c{cid}] #{req_n} headers: "
@@ -161,8 +160,38 @@ class Handler(socketserver.BaseRequestHandler):
             )
 
             if not keep_alive:
-                log.info(f"[c{cid}] closing after response (Connection: close)")
+                log.info(f"[c{cid}] closing (Connection: close)")
                 return
+
+    def _read_chunked(self, sock, buf, cid):
+        """Return (body, chunk_count, leftover_buf). On failure: (b'', 0, None)."""
+        body = b""
+        chunks = 0
+        while True:
+            size_line, buf = read_until(sock, buf, b"\r\n")
+            if size_line is None:
+                log.warning(f"[c{cid}] peer EOF mid-chunk-header")
+                return b"", 0, None
+            try:
+                size = int(size_line, 16)
+            except ValueError:
+                log.warning(f"[c{cid}] bad chunk size: {size_line!r}")
+                return b"", 0, None
+            if size == 0:
+                # consume trailers until an empty line
+                while True:
+                    trailer, buf = read_until(sock, buf, b"\r\n")
+                    if trailer is None:
+                        return b"", 0, None
+                    if trailer == b"":
+                        break
+                return body, chunks, buf
+            data, buf = read_exact(sock, buf, size + 2)  # body + CRLF
+            if data is None:
+                log.warning(f"[c{cid}] peer EOF mid-chunk-data")
+                return b"", 0, None
+            body += data[:size]
+            chunks += 1
 
 
 class Server(socketserver.ThreadingTCPServer):
@@ -170,12 +199,13 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+# ── main ───────────────────────────────────────────────────────────
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=9000)
     p.add_argument("-v", "--verbose", action="store_true",
-                   help="log every header (debug level)")
+                   help="log all headers per request (debug level)")
     a = p.parse_args()
 
     logging.basicConfig(
@@ -191,9 +221,10 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        acc, cls, req = _snapshot()
         log.info(
-            f"shutdown: accepts={_accepts} closes={_closes} "
-            f"requests={_requests} open={_accepts - _closes}"
+            f"shutdown: accepts={acc} closes={cls} requests={req} "
+            f"open={acc - cls}"
         )
 
 
