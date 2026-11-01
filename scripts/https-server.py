@@ -11,4 +11,4 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-HTTPServer(("127.0.0.1", 8888), Handler).serve_forever()
+HTTPServer(("127.0.0.1", 80), Handler).serve_forever()

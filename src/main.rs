@@ -36,13 +36,6 @@ fn main() {
         )
     });
 
-    let outbound: SocketAddr = args.outbound.parse().unwrap_or_else(|e| {
-        panic!(
-            "invalid --outbound value '{}': {} (expected IP:PORT, e.g. 127.0.0.1:9090)",
-            args.outbound, e
-        )
-    });
-
     let core_ids = core_affinity::get_core_ids().unwrap();
     println!("number of cores: {}", core_ids.len());
     let mut children = Vec::new();
@@ -56,7 +49,7 @@ fn main() {
                 if !core_affinity::set_for_current(id) {
                     println!("core_affinity failed");
                 }
-                let proxy = proxy_server::proxy::AsyncProxy::new(inbound, outbound)
+                let proxy = proxy_server::proxy::AsyncProxy::new(inbound, args.outbound)
                     .unwrap_or_else(|e| panic!("Initiling worker process failed with error: {e}"));
                 let _ =proxy.run().unwrap_or_else(|e|{panic!("running proxy server failed with error: {e}")});
                 process::exit(0);

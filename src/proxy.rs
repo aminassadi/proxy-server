@@ -1,182 +1,121 @@
+use httparse::parse_headers;
 use socket2::{Domain, Protocol, Socket, Type};
-use std::{net::SocketAddr, println, sync::Arc};
+use std::net::SocketAddr;
+use std::println;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::{
-    io,
-    net::TcpListener,
-    runtime::{Builder, Runtime},
-};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::runtime::{Builder, Runtime};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
 
-use tokio::net::{TcpSocket, TcpStream};
-use tokio::signal::unix::{SignalKind, signal};
+use crate::http::error::{bad_request, error_response, length_required};
+use crate::http::parser::{MAX_HEADER_SIZE, ParseResult};
 
 const MAX_BACKLOG: i32 = 1024;
 
-pub struct AsyncProxy {
-    inbound: SocketAddr,
-    outbound: SocketAddr,
-    rt: Runtime,
-    shutdown: CancellationToken,
-}
-
-impl AsyncProxy {
-    pub fn new(inbound: SocketAddr, outbound: SocketAddr) -> std::io::Result<Self> {
-        let rt: Runtime = Builder::new_current_thread().enable_all().build()?;
-
-        Ok(Self {
-            inbound,
-            outbound,
-            rt,
-            shutdown: CancellationToken::new(),
-        })
-    }
-
-    pub fn run(self) -> std::io::Result<()> {
-        self.rt
-            .block_on(Self::runtime(self.inbound, self.outbound, self.shutdown))
-    }
-
-    async fn runtime(
-        inbound: SocketAddr,
-        outbound: SocketAddr,
-        shutdown: CancellationToken,
-    ) -> std::io::Result<()> {
-        let listener = bind_reuseport(inbound).await?;
-        let outbound = Arc::new(outbound);
-        tokio::spawn(install_shutdown_signals(shutdown.clone()));
-        loop {
-            tokio::select! {
-                biased;
-
-                _ = shutdown.cancelled() => {
-                    break;
-                }
-                accepted = listener.accept() => {
-                    let (stream, peer) = accepted?;
-                    let outbound = Arc::clone(&outbound);
-                    let shutdown = shutdown.clone();
-
-                    tokio::spawn(async move {
-                        println!("incomming socket: {peer}, pid: {}", std::process::id());
-
-                        tokio::select! {
-                            _ = shutdown.cancelled() => {}
-                            r = handle_connection(stream, peer, &outbound, shutdown.clone()) => {
-                                if let Err(e) = r {
-                                    eprintln!("[{peer}] {e}");
-                                }
-                             }
-                        }
-                    });
-                }
-            }
-        }
-        Ok(())
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyState {
+    ReadingHeaders,
+    ForwardingBody { remaining: usize },
 }
 
 async fn handle_connection(
-    mut client_stream: tokio::net::TcpStream,
-    peer: std::net::SocketAddr,
-    outbound: &std::net::SocketAddr,
+    mut client_stream: TcpStream,
+    peer: SocketAddr,
+    outbound: &str,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
-    let mut client_buff = Vec::with_capacity(64 * 1024);
+    let mut client_buff = Vec::with_capacity(8192);
     let mut server_buff = vec![0u8; 8192];
-    let mut content_len: Option<usize> = None;
-    let mut body_received: usize = 0;
+    let mut state = ProxyState::ReadingHeaders;
+     let connect_addr = if outbound.contains(':') {
+        outbound.to_string()
+    } else {
+        format!("{}:80", outbound)
+    };
 
-    let mut server_stream = TcpStream::connect(outbound).await?;
+    // 3. Connect using the properly formatted address
+    let mut server_stream = TcpStream::connect(&connect_addr).await?;
 
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
+
             r = client_stream.read_buf(&mut client_buff) => {
-                let incomming_packet_len = r?;
-                if incomming_packet_len == 0 {
-                    return Ok(());
-                }
-                while !client_buff.is_empty(){
-                    if content_len.is_none(){
-                        let mut headers = [httparse::EMPTY_HEADER; 64];
-                        let mut req = httparse::Request::new(&mut headers);
-                        match req.parse(&client_buff) {
-                            Ok(httparse::Status::Complete(n)) => {
-                                println!(
-                                    "[{peer}] {} {} HTTP/1.{}",
-                                    req.method.unwrap_or("?"),
-                                    req.path.unwrap_or("?"),
-                                    req.version.unwrap_or(0),
-                                );
-                                let mut cl = 0usize;
-                                for h in req.headers.iter() {
-                                    println!("  {}: {}", h.name, String::from_utf8_lossy(h.value));
-                                    if h.name.eq_ignore_ascii_case("transfer-encoding") {
-                                            let v = String::from_utf8_lossy(h.value).to_ascii_lowercase();
-                                            if v.split(',').any(|t| t.trim() == "chunked") {
-                                                client_stream.write_all(&length_required()).await?;
-                                                return Ok(());
-                                            }
-                                        }
-                                    if h.name.eq_ignore_ascii_case("content-length") {
-                                        cl = std::str::from_utf8(h.value)
-                                        .ok()
-                                        .and_then(|s| s.trim().parse().ok())
-                                        .ok_or_else(|| std::io::Error::new(
-                                            std::io::ErrorKind::InvalidData, "bad Content-Length"))?;
+                let n = r?;
+                if n == 0 { return Ok(()); } // Client closed connection
+
+                loop {
+                    match state {
+                        ProxyState::ReadingHeaders => {
+                            if client_buff.is_empty() { break; }
+
+                            if client_buff.len() > MAX_HEADER_SIZE {
+                                let _ = client_stream.write_all(&bad_request("Request Header Fields Too Large")).await;
+                                return Ok(());
+                            }
+
+                            match crate::http::parser::parse_headers(&client_buff, &outbound) {
+                                ParseResult::Incomplete => break,
+                                ParseResult::Invalid(e) => {
+                                    eprintln!("[{peer}] Invalid: {e}");
+                                    let _ = client_stream.write_all(&bad_request(&e)).await;
+                                    return Ok(());
+                                }
+                                ParseResult::Unsupported(e) => {
+                                    eprintln!("[{peer}] Unsupported: {e}");
+                                    let _ = client_stream.write_all(&error_response(501, "Not Implemented", &e)).await;
+                                    return Ok(());
+                                }
+                                ParseResult::LengthRequired => {
+                                    let _ = client_stream.write_all(&length_required()).await;
+                                    return Ok(());
+                                }
+                                ParseResult::Complete { header_len, content_length } => {
+                                    server_stream.write_all(&client_buff[..header_len]).await?;
+                                    client_buff.drain(..header_len);
+
+                                    if content_length == 0 {
+                                        state = ProxyState::ReadingHeaders;
+                                    } else {
+                                        state = ProxyState::ForwardingBody { remaining: content_length };
                                     }
                                 }
-                                server_stream.write_all(&client_buff[..n]).await?;
-                                client_buff.drain(..n);
-                                content_len = Some(cl);
                             }
-                            Ok(httparse::Status::Partial) => {
-                                if client_buff.len() > 64 * 1024 {
-                                    return Err(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        "request headers exceed 64 KiB",
-                                    ));
-                                }
+                        }
+
+                        ProxyState::ForwardingBody { mut remaining } => {
+                            let take = remaining.min(client_buff.len());
+                            if take > 0 {
+                                server_stream.write_all(&client_buff[..take]).await?;
+                                client_buff.drain(..take);
+                                remaining -= take;
+                            }
+
+                            if remaining == 0 {
+                                state = ProxyState::ReadingHeaders;
+                            } else {
                                 break;
-                            }
-                            Err(e) => {
-                                eprintln!("[{peer}] malformed: {e}");
-                                client_stream.write_all(&bad_request("malformed")).await?;
-                                return Ok(());
                             }
                         }
                     }
-                      if let Some(cl) = content_len {
-                        let remaining = cl - body_received;
-                        let take = remaining.min(client_buff.len());
-                        if take > 0 {
-                            server_stream.write_all(&client_buff[..take]).await?;
-                            client_buff.drain(..take);            
-                            body_received += take;
-                        }
-                        if body_received >= cl {
-                            content_len = None;
-                            body_received = 0;
-                        }else{
-                            break;
-                        }
-                 }
-             }
-            }
-            r = server_stream.read(&mut server_buff) =>{
-                let n = r?;
-                if n==0{
-                    return Ok(()) //todo: this is error server connection failed, may response with 500
                 }
-                client_stream.write_all(&server_buff[..n]).await?
+            }
+
+            r = server_stream.read(&mut server_buff) => {
+                let n = r?;
+                if n == 0 {
+                    return Ok(());
+                }
+                client_stream.write_all(&server_buff[..n]).await?;
             }
         }
     }
-    return Ok(());
+    Ok(())
 }
 
-pub async fn bind_reuseport(addr: SocketAddr) -> io::Result<TcpListener> {
+pub async fn bind_reuseport(addr: SocketAddr) -> std::io::Result<TcpListener> {
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
     socket.set_reuse_port(true)?;
@@ -200,32 +139,63 @@ async fn install_shutdown_signals(shutdown: CancellationToken) {
     shutdown.cancel();
 }
 
-pub fn validate_request() {}
-
-fn bad_request(reason: &str) -> Vec<u8> {
-    error_response(400, "Bad Request", reason)
+pub struct AsyncProxy {
+    inbound: SocketAddr,
+    outbound: String,
+    rt: Runtime,
+    shutdown: CancellationToken,
 }
 
-fn length_required() -> Vec<u8> {
-    error_response(411, "Length Required", "request body length could not be determined")
-}
+impl AsyncProxy {
+    // Note: outbound is now a String, not a SocketAddr
+    pub fn new(inbound: SocketAddr, outbound: String) -> std::io::Result<Self> {
+        let rt: Runtime = Builder::new_current_thread().enable_all().build()?;
 
-fn error_response(status: u16, reason: &str, detail: &str) -> Vec<u8> {
-    let body = format!("{status} {reason}\n{detail}\n");
-    let body = body.replace('\r', "").replace('\n', " ").trim_end().to_string()
-             + "\n";
-    let mut out = Vec::with_capacity(128 + body.len());
-    out.extend_from_slice(
-        format!(
-            "HTTP/1.1 {status} {reason}\r\n\
-             Content-Type: text/plain; charset=utf-8\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n",
-            body.len()
-        )
-        .as_bytes(),
-    );
-    out.extend_from_slice(body.as_bytes());
-    out
+        Ok(Self {
+            inbound,
+            outbound,
+            rt,
+            shutdown: CancellationToken::new(),
+        })
+    }
+
+    pub fn run(self) -> std::io::Result<()> {
+        self.rt
+            .block_on(Self::runtime(self.inbound, self.outbound, self.shutdown))
+    }
+
+    async fn runtime(
+        inbound: SocketAddr,
+        outbound: String,
+        shutdown: CancellationToken,
+    ) -> std::io::Result<()> {
+        let listener = bind_reuseport(inbound).await?;
+        let outbound = Arc::new(outbound);
+
+        tokio::spawn(install_shutdown_signals(shutdown.clone()));
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => break,
+                accepted = listener.accept() => {
+                    let (stream, peer) = accepted?;
+                    let outbound = Arc::clone(&outbound);
+                    let shutdown = shutdown.clone();
+
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => {}
+                            r = handle_connection(stream, peer, &outbound, shutdown.clone()) => {
+                                if let Err(e) = r {
+                                    eprintln!("[{peer}] Connection Error: {e}");
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
