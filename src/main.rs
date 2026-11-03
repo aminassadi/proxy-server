@@ -1,4 +1,5 @@
 use core::panic;
+use std::os::unix::net::UnixListener;
 use std::println;
 use std::process;
 
@@ -11,11 +12,13 @@ use nix::unistd::ForkResult;
 use nix::unistd::Pid;
 use nix::unistd::fork;
 use proxy_server;
+use proxy_server::log_server::logs::Logs;
+use proxy_server::log_server::server::LogServer;
+use tokio::runtime::Builder;
+use tokio::signal::unix::SignalKind;
+use tokio::signal::unix::signal;
+use tokio_util::sync::CancellationToken;
 use std::net::SocketAddr;
-
-use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
-
 
 const LOG_SERVER_SOURCE: &str = "log-source.sock";
 const LOG_SERVER_SINK: &str = "log-sink.sock";
@@ -40,6 +43,24 @@ fn main() {
         )
     });
 
+    let input = UnixListener::bind(LOG_SERVER_SOURCE).unwrap_or_else(|e|{
+          panic!(
+            "Binding to the unix socket filed, address:{}, Error:{}",
+            LOG_SERVER_SOURCE, e
+        )
+    });
+    let output = match UnixListener::bind(LOG_SERVER_SINK) {
+        Ok(output) => output,
+        Err(e) => {
+            drop(input);
+            let _ = std::fs::remove_file(LOG_SERVER_SOURCE);
+           panic!(
+            "Binding to the unix socket filed, address:{}, Error:{}",
+            LOG_SERVER_SINK, e
+        )
+        }
+    };
+
     let core_ids = core_affinity::get_core_ids().unwrap();
     println!("number of cores: {}", core_ids.len());
     let mut children = Vec::new();
@@ -60,15 +81,37 @@ fn main() {
             }
         }
     }
-    println!("this is parent, pid: {}", process::id());
-    wait_for_shutdown(&children);
+    run_log_server(input, output);
+    stop_workers(&children);
+    let _ = std::fs::remove_file(LOG_SERVER_SOURCE);
+    let _ = std::fs::remove_file(LOG_SERVER_SINK);
 }
 
-fn wait_for_shutdown(children: &[Pid]) -> std::io::Result<()> {
-    let mut signals = Signals::new([SIGINT, SIGTERM])?;
+fn run_log_server(input: UnixListener, output: UnixListener) -> std::io::Result<()> {
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    runtime.block_on(async move {
+        input.set_nonblocking(true)?;
+        output.set_nonblocking(true)?;
+        let server = LogServer::from_listeners(
+            tokio::net::UnixListener::from_std(input)?,
+            tokio::net::UnixListener::from_std(output)?,
+            Logs::new(),
+        );
+        let shutdown = CancellationToken::new();
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let result = tokio::select! {
+            result = server.run(shutdown.clone()) => result,
+            _ = sigint.recv() => Ok(()),
+            _ = sigterm.recv() => Ok(()),
+        };
+        shutdown.cancel();
+        result
+    })
+}
 
-    let _ = signals.forever().next();
 
+fn stop_workers(children: &[Pid]) {
     for &pid in children {
         let _ = kill(pid, Signal::SIGTERM);
     }
@@ -78,10 +121,8 @@ fn wait_for_shutdown(children: &[Pid]) -> std::io::Result<()> {
             match waitpid(pid, None) {
                 Ok(_) => break,
                 Err(nix::errno::Errno::EINTR) => continue,
-                Err(_) => break,   
+                Err(_) => break,
             }
         }
     }
-
-    Ok(())
 }

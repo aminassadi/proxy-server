@@ -108,15 +108,17 @@ class Handler(socketserver.BaseRequestHandler):
             chunked = "chunked" in headers.get("transfer-encoding", "").lower()
 
             if chunked:
-                body, chunk_count, ok = self._read_chunked(sock, buf, cid)
-                if not ok:
+                body, chunk_count, buf = self._read_chunked(sock, buf, cid)
+                if buf is None:
                     return
-                buf = ok  # _read_chunked returns leftover in 3rd slot
             else:
                 try:
                     cl = int(headers.get("content-length", "0"))
+                    if cl < 0:
+                        raise ValueError("negative Content-Length")
                 except ValueError:
-                    cl = 0
+                    log.warning(f"[c{cid}] invalid Content-Length")
+                    return
                 body, buf = read_exact(sock, buf, cl)
                 if body is None:
                     log.warning(f"[c{cid}] peer EOF mid-body (wanted {cl})")
@@ -173,7 +175,9 @@ class Handler(socketserver.BaseRequestHandler):
                 log.warning(f"[c{cid}] peer EOF mid-chunk-header")
                 return b"", 0, None
             try:
-                size = int(size_line, 16)
+                size = int(size_line.split(b";", 1)[0], 16)
+                if size < 0:
+                    raise ValueError("negative chunk size")
             except ValueError:
                 log.warning(f"[c{cid}] bad chunk size: {size_line!r}")
                 return b"", 0, None
@@ -189,6 +193,9 @@ class Handler(socketserver.BaseRequestHandler):
             data, buf = read_exact(sock, buf, size + 2)  # body + CRLF
             if data is None:
                 log.warning(f"[c{cid}] peer EOF mid-chunk-data")
+                return b"", 0, None
+            if data[-2:] != b"\r\n":
+                log.warning(f"[c{cid}] missing chunk terminator")
                 return b"", 0, None
             body += data[:size]
             chunks += 1

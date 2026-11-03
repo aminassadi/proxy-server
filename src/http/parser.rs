@@ -1,5 +1,7 @@
+use std::{print, println};
+
 pub const MAX_HEADER_SIZE: usize = 64 * 1024;
-pub const COLLECT_LOG_URI: &str = ".svc/collect-log";
+pub const COLLECT_LOG_URI: &str = "/.svc/collect-log";
 #[derive(Debug)]
 pub enum ParseResult {
     Incomplete,

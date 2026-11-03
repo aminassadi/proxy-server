@@ -9,6 +9,7 @@ loudly until the Rust side sends 400/411 instead of just closing. Use --only
 to run a subset while developing.
 """
 import argparse
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -22,7 +23,7 @@ SCENARIOS = [
     ("large-body",      ["large-body", "--size", "100000"],            "100 KB body (>> MTU)",                   False),
     ("glued",           ["glued"],                                     "headers + body in one syscall",          False),
     ("partial",         ["partial", "--delay", "0.001"],               "headers byte-by-byte",                   False),
-    ("chunked",         ["chunked", "--expect", "reject"],             "proxy rejects chunked (400/close)",      True),
+    ("chunked",         ["chunked", "--expect", "reject"],             "proxy rejects chunked (400/501/close)",      True),
     ("bad-request",     ["bad-request"],                               "malformed request -> 400",               True),
     ("length-required", ["length-required"],                           "POST no CL/TE -> 411",                   True),
 ]
@@ -30,7 +31,7 @@ SCENARIOS = [
 
 def run_one(client_args, base, timeout):
     """Run one scenario; return (passed, duration_s, summary_str, captured_output)."""
-    cmd = [sys.executable, "client.py", *client_args, *base]
+    cmd = [sys.executable, str(Path(__file__).with_name("client.py")), *client_args, *base]
     start = time.monotonic()
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -53,7 +54,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--proxy-host", "--host", dest="proxy_host", default="127.0.0.1")
     p.add_argument("--proxy-port", "--port", dest="proxy_port", type=int, default=8080)
-    p.add_argument("--host-header", default="example.test")
+    p.add_argument("--host-header", default="example.test",
+                   help="must match the proxy --outbound value")
     p.add_argument("--timeout", type=float, default=30.0,
                    help="per-scenario timeout (seconds)")
     p.add_argument("--only", action="append", default=None,
@@ -61,11 +63,17 @@ def main():
     p.add_argument("--skip-aspirational", action="store_true",
                    help="skip scenarios that require Rust-side changes")
     a = p.parse_args()
+    if a.timeout <= 0:
+        p.error("--timeout must be positive")
+    unknown = set(a.only or ()) - {name for name, *_ in SCENARIOS}
+    if unknown:
+        p.error(f"unknown scenarios: {', '.join(sorted(unknown))}")
 
     base = [
         "--host", a.proxy_host,
         "--port", str(a.proxy_port),
         "--host-header", a.host_header,
+        "--timeout", str(a.timeout),
     ]
 
     selected = []

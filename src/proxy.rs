@@ -32,6 +32,9 @@ async fn handle_connection(
     let mut client_buff = Vec::with_capacity(8192);
     let mut server_buff = vec![0u8; 8192];
     let mut state = ProxyState::ReadingHeaders;
+    let expected_hostname = outbound
+        .rsplit_once(':')
+        .map_or(outbound, |(hostname, _port)| hostname);
     let connect_addr = if outbound.contains(':') {
         outbound.to_string()
     } else {
@@ -58,7 +61,7 @@ async fn handle_connection(
                                 let _ = client_stream.write_all(&bad_request("Request Header Fields Too Large")).await;
                                 return Ok(());
                             }
-                            let parse = crate::http::parser::parse_headers(&client_buff, &outbound);
+                            let parse = crate::http::parser::parse_headers(&client_buff, &expected_hostname);
                             if !matches!(&parse, ParseResult::Incomplete){
                                 if let Err(e) = send_log_request(log_source_addr, peer).await{
                                     eprintln!("[{peer}] Sending request log failed: {e}");
