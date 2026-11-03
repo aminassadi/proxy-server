@@ -1,9 +1,10 @@
 pub const MAX_HEADER_SIZE: usize = 64 * 1024;
-
+pub const COLLECT_LOG_URI: &str = ".svc/collect-log";
 #[derive(Debug)]
 pub enum ParseResult {
     Incomplete,
     Complete { header_len: usize, content_length: usize },
+    CollectLog,
     Invalid(String),
     Unsupported(String),
     LengthRequired,
@@ -29,6 +30,13 @@ pub fn parse_headers(buf: &[u8], expected_host: &str) -> ParseResult {
                         .ok()
                         .and_then(|s| s.trim().parse::<usize>().ok());
                 }
+            }
+
+            if req.path == Some(COLLECT_LOG_URI){
+                if method != "GET"{
+                    return ParseResult::Invalid("Invalid method".into());
+                }
+                return ParseResult::CollectLog;
             }
 
             if host != expected_host {

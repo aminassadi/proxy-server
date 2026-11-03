@@ -16,6 +16,10 @@ use std::net::SocketAddr;
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
+
+const LOG_SERVER_SOURCE: &str = "log-source.sock";
+const LOG_SERVER_SINK: &str = "log-sink.sock";
+
 #[derive(Parser, Debug)]
 #[command(name = "proxy-server", version, about = "Simple proxy config")]
 struct Args {
@@ -49,7 +53,7 @@ fn main() {
                 if !core_affinity::set_for_current(id) {
                     println!("core_affinity failed");
                 }
-                let proxy = proxy_server::proxy::AsyncProxy::new(inbound, args.outbound)
+                let proxy = proxy_server::proxy::AsyncProxy::new(inbound, args.outbound, LOG_SERVER_SOURCE.into(), LOG_SERVER_SINK.into())
                     .unwrap_or_else(|e| panic!("Initiling worker process failed with error: {e}"));
                 let _ =proxy.run().unwrap_or_else(|e|{panic!("running proxy server failed with error: {e}")});
                 process::exit(0);

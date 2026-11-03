@@ -24,6 +24,8 @@ async fn handle_connection(
     mut client_stream: TcpStream,
     peer: SocketAddr,
     outbound: &str,
+    log_source_addr: &str,
+    log_sink_addr: &str,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
     let mut client_buff = Vec::with_capacity(8192);
@@ -81,6 +83,9 @@ async fn handle_connection(
                                     } else {
                                         state = ProxyState::ForwardingBody { remaining: content_length };
                                     }
+                                }
+                                ParseResult::CollectLog =>{
+                                    //todo
                                 }
                             }
                         }
@@ -142,18 +147,22 @@ async fn install_shutdown_signals(shutdown: CancellationToken) {
 pub struct AsyncProxy {
     inbound: SocketAddr,
     outbound: String,
+    log_source_addr: String,
+    log_sink_addr:String,
     rt: Runtime,
     shutdown: CancellationToken,
 }
 
 impl AsyncProxy {
     // Note: outbound is now a String, not a SocketAddr
-    pub fn new(inbound: SocketAddr, outbound: String) -> std::io::Result<Self> {
+    pub fn new(inbound: SocketAddr, outbound: String, log_source_addr: String, log_sink_addr: String) -> std::io::Result<Self> {
         let rt: Runtime = Builder::new_current_thread().enable_all().build()?;
 
         Ok(Self {
             inbound,
             outbound,
+            log_source_addr,
+            log_sink_addr,
             rt,
             shutdown: CancellationToken::new(),
         })
@@ -161,18 +170,23 @@ impl AsyncProxy {
 
     pub fn run(self) -> std::io::Result<()> {
         self.rt
-            .block_on(Self::runtime(self.inbound, self.outbound, self.shutdown))
+            .block_on(Self::runtime(self.inbound, self.outbound, self.shutdown, self.log_source_addr, self.log_sink_addr))
     }
 
     async fn runtime(
         inbound: SocketAddr,
         outbound: String,
         shutdown: CancellationToken,
+        log_source_addr: String,
+        log_sink_addr: String,
     ) -> std::io::Result<()> {
         let listener = bind_reuseport(inbound).await?;
         let outbound = Arc::new(outbound);
 
         tokio::spawn(install_shutdown_signals(shutdown.clone()));
+
+        let log_source = Arc::new(log_source_addr);
+        let log_sink = Arc::new(log_sink_addr);
 
         loop {
             tokio::select! {
@@ -182,11 +196,14 @@ impl AsyncProxy {
                     let (stream, peer) = accepted?;
                     let outbound = Arc::clone(&outbound);
                     let shutdown = shutdown.clone();
+                    let log_source = log_source.clone();
+                    let log_sink = log_sink.clone();
+
 
                     tokio::spawn(async move {
                         tokio::select! {
                             _ = shutdown.cancelled() => {}
-                            r = handle_connection(stream, peer, &outbound, shutdown.clone()) => {
+                            r = handle_connection(stream, peer, &outbound,  &log_source, &log_sink, shutdown.clone()) => {
                                 if let Err(e) = r {
                                     eprintln!("[{peer}] Connection Error: {e}");
                                 }
