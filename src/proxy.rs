@@ -3,8 +3,9 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::println;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::runtime::{Builder, Runtime};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio_util::sync::CancellationToken;
@@ -57,8 +58,13 @@ async fn handle_connection(
                                 let _ = client_stream.write_all(&bad_request("Request Header Fields Too Large")).await;
                                 return Ok(());
                             }
-
-                            match crate::http::parser::parse_headers(&client_buff, &outbound) {
+                            let parse = crate::http::parser::parse_headers(&client_buff, &outbound);
+                            if !matches!(&parse, ParseResult::Incomplete){
+                                if let Err(e) = send_log_request(log_source_addr, peer).await{
+                                    eprintln!("[{peer}] Sending request log failed: {e}");
+                                }
+                            }
+                            match parse {
                                 ParseResult::Incomplete => break,
                                 ParseResult::Invalid(e) => {
                                     eprintln!("[{peer}] Invalid: {e}");
@@ -144,6 +150,15 @@ async fn install_shutdown_signals(shutdown: CancellationToken) {
     shutdown.cancel();
 }
 
+async fn send_log_request(addr: &str, peer: SocketAddr) -> std::io::Result<()>{
+    let epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_secs();
+    let message = format!("{epoch} {} {}\n", peer.ip(), std::process::id());
+    let mut stream = UnixStream::connect(addr).await?;
+    stream.write_all(message.as_bytes()).await
+}
 pub struct AsyncProxy {
     inbound: SocketAddr,
     outbound: String,
