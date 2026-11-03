@@ -32,7 +32,7 @@ async fn handle_connection(
     let mut client_buff = Vec::with_capacity(8192);
     let mut server_buff = vec![0u8; 8192];
     let mut state = ProxyState::ReadingHeaders;
-     let connect_addr = if outbound.contains(':') {
+    let connect_addr = if outbound.contains(':') {
         outbound.to_string()
     } else {
         format!("{}:80", outbound)
@@ -91,7 +91,8 @@ async fn handle_connection(
                                     }
                                 }
                                 ParseResult::CollectLog =>{
-                                    //todo
+                                    directional_copy_logs(log_sink_addr, & mut client_stream).await?;
+                                    return Ok(());
                                 }
                             }
                         }
@@ -150,7 +151,7 @@ async fn install_shutdown_signals(shutdown: CancellationToken) {
     shutdown.cancel();
 }
 
-async fn send_log_request(addr: &str, peer: SocketAddr) -> std::io::Result<()>{
+async fn send_log_request(addr: &str, peer: SocketAddr) -> std::io::Result<()> {
     let epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(std::io::Error::other)?
@@ -159,18 +160,47 @@ async fn send_log_request(addr: &str, peer: SocketAddr) -> std::io::Result<()>{
     let mut stream = UnixStream::connect(addr).await?;
     stream.write_all(message.as_bytes()).await
 }
+
+async fn directional_copy_logs(
+    log_sink_addr: &str,
+    client_stream: &mut TcpStream,
+) -> std::io::Result<()> {
+    let mut server_stream = UnixStream::connect(log_sink_addr).await?;
+    let mut logs = Vec::new();
+    let mut server_buff = vec![0u8; 8192];
+
+    loop {
+        let n = server_stream.read(&mut server_buff).await?;
+        if n == 0 {
+            break;
+        }
+        logs.extend_from_slice(&server_buff[..n]);
+    }
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
+        logs.len()
+    );
+    client_stream.write_all(headers.as_bytes()).await?;
+    client_stream.write_all(&logs).await?;
+    Ok(())
+}
 pub struct AsyncProxy {
     inbound: SocketAddr,
     outbound: String,
     log_source_addr: String,
-    log_sink_addr:String,
+    log_sink_addr: String,
     rt: Runtime,
     shutdown: CancellationToken,
 }
 
 impl AsyncProxy {
     // Note: outbound is now a String, not a SocketAddr
-    pub fn new(inbound: SocketAddr, outbound: String, log_source_addr: String, log_sink_addr: String) -> std::io::Result<Self> {
+    pub fn new(
+        inbound: SocketAddr,
+        outbound: String,
+        log_source_addr: String,
+        log_sink_addr: String,
+    ) -> std::io::Result<Self> {
         let rt: Runtime = Builder::new_current_thread().enable_all().build()?;
 
         Ok(Self {
@@ -184,8 +214,13 @@ impl AsyncProxy {
     }
 
     pub fn run(self) -> std::io::Result<()> {
-        self.rt
-            .block_on(Self::runtime(self.inbound, self.outbound, self.shutdown, self.log_source_addr, self.log_sink_addr))
+        self.rt.block_on(Self::runtime(
+            self.inbound,
+            self.outbound,
+            self.shutdown,
+            self.log_source_addr,
+            self.log_sink_addr,
+        ))
     }
 
     async fn runtime(
